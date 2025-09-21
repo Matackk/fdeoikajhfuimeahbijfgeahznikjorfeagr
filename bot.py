@@ -61,6 +61,8 @@ CB_BACK_MENU = 'back_to_menu'
 CB_EDIT_INFO = 'edit_info'
 CB_OPEN_MENU = 'open_menu'
 CB_START_FLOW = 'start_flow'
+CB_REPLY_PREFIX = 'reply_to:'  # helpdesk: admin reply target
+CB_END_REPLY = 'end_reply'  # end current reply thread
 
 # Keys used in user_data
 KEY_OFFER = 'offer'              # 'beginner' | 'pro'
@@ -71,6 +73,9 @@ KEY_EDIT_MODE = 'edit_mode'      # bool
 KEY_LAST_WELCOME_TS = 'last_welcome_ts'  # float seconds
 
 # -------------------------- Utils --------------------------
+
+def is_admin_chat(update: Update) -> bool:
+    return bool(update.effective_chat and update.effective_chat.id == ADMIN_CHAT_ID)
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
@@ -163,6 +168,13 @@ async def notify_admin(context: ContextTypes.DEFAULT_TYPE, user: Optional[User],
             text=text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
+        )
+        # Helpdesk: add 'Reply' control card
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton('🗨️ Répondre', callback_data=f'{CB_REPLY_PREFIX}{uid}')]])
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text='👉 Appuie sur “Répondre” pour écrire à cet utilisateur.',
+            reply_markup=kb
         )
     except Exception as e:
         logging.exception('Failed to notify admin: %s', e)
@@ -412,6 +424,154 @@ async def edit_info_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     await q.edit_message_text(EDIT_REMINDER, parse_mode=ParseMode.HTML)
     return ASK_PSEUDO
 
+# -------------------------- Helpdesk (Admin ⇄ User) --------------------------
+
+async def handle_user_inbox(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mirror any non-command message from users to ADMIN_CHAT_ID with a reply button.
+    Admin chat is ignored here to avoid loops.
+    """
+    msg = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not msg or not chat or not user:
+        return
+    # Ignore admin chat here; admin messages handled by a dedicated handler
+    if chat.id == ADMIN_CHAT_ID:
+        return
+    # Ignore commands - conversation handlers already process those
+    if msg.text and msg.text.startswith('/'):
+        return
+    # Copy the original message to admin (keeps media & caption)
+    try:
+        await context.bot.copy_message(
+            chat_id=ADMIN_CHAT_ID,
+            from_chat_id=chat.id,
+            message_id=msg.message_id,
+            protect_content=True,
+        )
+        # Send a control card with reply button
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton('🗨️ Répondre', callback_data=f'{CB_REPLY_PREFIX}{user.id}')]])
+        info = (
+            '<b>Nouveau message utilisateur</b>\n'
+            f'• De : <a href="tg://user?id={user.id}">{user.first_name or "Utilisateur"}</a> '
+            f'(ID: <code>{user.id}</code>)\n'
+            f'• Chat ID : <code>{chat.id}</code>'
+        )
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=info,
+            parse_mode=ParseMode.HTML,
+            reply_markup=kb,
+            disable_web_page_preview=True,
+        )
+        # Auto-thread: set current reply target to this user so admin can just type to continue
+        context.chat_data['reply_to'] = user.id
+    except Exception as e:
+        logging.warning('Failed to mirror to admin: %s', e)
+
+async def reply_to_user_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Admin clicked 'Répondre' under a mirrored user message."""
+    if not is_admin_chat(update):
+        q = update.callback_query
+        if q:
+            await q.answer('Action réservée à l’admin.', show_alert=True)
+        return ConversationHandler.END
+    q = update.callback_query
+    if not q or not q.data or not q.data.startswith(CB_REPLY_PREFIX):
+        return ConversationHandler.END
+    await q.answer()
+    try:
+        target_id = int(q.data.split(':', 1)[1])
+    except Exception:
+        await q.edit_message_text('ID utilisateur invalide.')
+        return ConversationHandler.END
+    # Store target in admin chat_data
+    context.chat_data['reply_to'] = target_id
+    try:
+        await context.bot.send_message(
+            chat_id=ADMIN_CHAT_ID,
+            text=f'🧵 Réponse active à <code>{target_id}</code>. Envoyez vos messages. Tapez /done pour terminer.',
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⛔ Terminer', callback_data=CB_END_REPLY)]])
+        )
+    except Exception:
+        pass
+    await q.edit_message_text(
+        f'🗨️ Répondre à <code>{target_id}</code> — envoie maintenant ton message (texte, photo, doc…).',
+        parse_mode=ParseMode.HTML
+    )
+    return ConversationHandler.END
+
+async def admin_outbound_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """When admin sends any message while a reply target is set, copy it to the user.
+    Also implements /pm <user_id> <message> as a direct text-send fallback."""
+    if not is_admin_chat(update):
+        return
+    msg = update.effective_message
+    if not msg:
+        return
+
+    # /pm <user_id> <message>
+    if msg.text and msg.text.startswith('/pm'):
+        parts = msg.text.split(maxsplit=2)
+        if len(parts) < 3:
+            await msg.reply_text('Usage: /pm <user_id> <message>')
+            return
+        try:
+            uid = int(parts[1])
+        except Exception:
+            await msg.reply_text('User ID invalide.')
+            return
+        text = parts[2]
+        try:
+            await context.bot.send_message(chat_id=uid, text=text, protect_content=True)
+            await msg.reply_text(f'✅ Message envoyé à {uid}.')
+        except Exception as e:
+            await msg.reply_text(f'❌ Échec de l’envoi: {e}')
+        return
+
+    # End the current thread with /done or /fin
+    if msg.text and msg.text.strip() in ('/done', '/fin'):
+        if context.chat_data.pop('reply_to', None):
+            await msg.reply_text('⛔ Fil terminé. Cliquez de nouveau sur 🗨️ Répondre pour choisir une cible, ou utilisez /pm.')
+        else:
+            await msg.reply_text('Aucun fil actif. Cliquez sur 🗨️ Répondre sous un message utilisateur, ou utilisez /pm.')
+        return
+
+    target_id = context.chat_data.get('reply_to')
+    if not target_id:
+        return  # Not in reply mode; ignore
+
+    try:
+        await context.bot.copy_message(
+            chat_id=target_id,
+            from_chat_id=update.effective_chat.id,
+            message_id=msg.message_id,
+            protect_content=True,
+        )
+        await msg.reply_text(f'✅ Message transmis à <code>{target_id}</code>.', parse_mode=ParseMode.HTML)
+    except Exception as e:
+        await msg.reply_text(f'❌ Échec de la transmission: {e}')
+
+async def end_reply_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    # Admin-only
+    if not is_admin_chat(update):
+        q = update.callback_query
+        if q:
+            await q.answer('Action réservée à l’admin.', show_alert=True)
+        return ConversationHandler.END
+    q = update.callback_query
+    if q:
+        await q.answer()
+        context.chat_data.pop('reply_to', None)
+        try:
+            await q.edit_message_text('⛔ Fil terminé.')
+        except Exception:
+            pass
+    return ConversationHandler.END
+
+# -------------------------- Other Commands --------------------------
+
 async def info(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     if msg:
@@ -495,7 +655,15 @@ def build_application() -> Application:
         allow_reentry=True,
     )
 
+    conv.block = False
     app.add_handler(conv)
+
+    # Helpdesk handlers
+    app.add_handler(CallbackQueryHandler(reply_to_user_cb, pattern=f'^{CB_REPLY_PREFIX}\\d+$'))
+    app.add_handler(CallbackQueryHandler(end_reply_cb, pattern=f'^{CB_END_REPLY}$'))
+    app.add_handler(MessageHandler((filters.ALL & ~filters.COMMAND) & filters.Chat(ADMIN_CHAT_ID), admin_outbound_handler), group=0)  # admin outbound (only admin chat)
+    # Mirror any non-command user message to admin
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_user_inbox), group=1)
 
     # Global handlers so buttons work even outside conversation
     app.add_handler(CommandHandler('menu', menu))
